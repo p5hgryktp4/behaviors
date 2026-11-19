@@ -51,6 +51,16 @@ function createVirtualDOM(
   return {float, parent, anchor}
 }
 
+// jsdom has no top layer, so simulate it by making `matches()` report the selector a
+// browser would match for a top-layer element (`:modal` or `:popover-open`).
+function markAsTopLayer(element: Element, selector: ':modal' | ':popover-open') {
+  const originalMatches = element.matches.bind(element)
+  Object.defineProperty(element, 'matches', {
+    configurable: true,
+    value: (value: string) => value === selector || originalMatches(value),
+  })
+}
+
 describe('getAnchoredPosition', () => {
   it('returns the correct position in the default case with no overflow', () => {
     const anchorRect = makeDOMRect(300, 200, 50, 50)
@@ -83,6 +93,7 @@ describe('getAnchoredPosition', () => {
     anchor.getBoundingClientRect = () => anchorRect
     document.body.getBoundingClientRect = () => makeDOMRect(0, 0, 1920, 0)
     Object.defineProperty(window, 'innerHeight', {get: () => 1080})
+    markAsTopLayer(float, ':modal')
     const settings: Partial<PositionSettings> = {anchorOffset: 4}
     const {top, left} = getAnchoredPosition(float, anchor, settings)
     expect(top).toEqual(254)
@@ -433,22 +444,49 @@ describe('getAnchoredPosition', () => {
       expect(result.top).toBeDefined()
       expect(result.left).toBeDefined()
 
-      // With the latest optimization (cached styles), we should make:
+      // With cached styles, the implementation makes:
+      // - 1 call for the floating element's own computed style
       // - 5 calls during traversal (one for each intermediate div)
-      // - 1 call for root during traversal (finds both positioned parent and clipping node, caches style)
-      // - 0 additional calls (both clippingRect and parent borders use cached styles from traversal)
-      // Total: 5 + 1 = 6 calls
+      // - 1 call for root during traversal (finds both the containing block and the
+      //   clipping node, and caches its style)
+      // - 0 additional calls (clipping rect and containing block borders reuse the
+      //   cached style from traversal)
+      // Total: 1 + 5 + 1 = 7 calls
       //
-      // Without optimization it would be:
-      // - 6 calls for getPositionedParent traversal (5 intermediate + 1 root)
+      // Without caching it would be:
+      // - 6 calls for the containing block traversal (5 intermediate + 1 root)
       // - 6 calls for getClippingRect traversal (5 intermediate + 1 root)
-      // - 1 call for positioned parent borders
-      // - 1 call for clipping rect borders (same element but separate call)
-      // Total: 6 + 6 + 1 + 1 = 14 calls
+      // - 1 call for the containing block borders
+      // - 1 call for the clipping rect borders (same element but separate call)
+      // Total: 6 + 6 + 1 + 1 = 14 calls, plus the floating element's style
       //
-      // Optimization reduces calls from 14 to 6 (57% reduction, improved from 42%)
-      expect(callCount).toBeLessThan(14)
+      // Caching roughly halves the getComputedStyle calls (14+1 -> 7)
+      expect(callCount).toBe(7)
       expect(callCount).toBeGreaterThan(0)
+
+      getComputedStyleSpy.mockRestore()
+    })
+
+    it('should keep getComputedStyle calls minimal when there is no positioned ancestor', () => {
+      const anchorRect = makeDOMRect(300, 200, 50, 50)
+      const floatingRect = makeDOMRect(NaN, NaN, 100, 100)
+      document.body.innerHTML = '<div id="float"></div><div id="anchor"></div>'
+      const float = document.querySelector('#float')!
+      const anchor = document.querySelector('#anchor')!
+      float.getBoundingClientRect = () => floatingRect
+      anchor.getBoundingClientRect = () => anchorRect
+
+      const originalGetComputedStyle = window.getComputedStyle
+      let callCount = 0
+      const getComputedStyleSpy = jest.spyOn(window, 'getComputedStyle').mockImplementation((element: Element) => {
+        callCount++
+        return originalGetComputedStyle(element)
+      })
+
+      getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+      // 1 call for the floating element + 1 for <body> + 1 for <html>
+      expect(callCount).toBe(3)
 
       getComputedStyleSpy.mockRestore()
     })
@@ -695,6 +733,524 @@ describe('getAnchoredPosition', () => {
       // The displayInViewport option should constrain this
       expect(left + 100).toBeLessThanOrEqual(1024) // right edge within viewport
       expect(top + 100).toBeLessThanOrEqual(768) // bottom edge within viewport
+    })
+  })
+
+  // Regression tests for https://github.com/primer/behaviors/issues/242: the offsets
+  // returned by `getAnchoredPosition` must be relative to the floating element's real CSS
+  // containing block. `document.body` is not that block unless it is itself positioned,
+  // which used to make a body margin or border shift top-layer overlays (tooltips,
+  // popovers, dialogs) and other elements without a positioned ancestor.
+  //
+  // jsdom has no layout engine, so rectangles and viewport/document metrics are stubbed
+  // per test. Real-browser coverage lives in `tests/browser` (Playwright).
+  describe('containing block resolution (#242)', () => {
+    const originalBodyRect = document.body.getBoundingClientRect
+    const originalDocumentElementRect = document.documentElement.getBoundingClientRect
+    const defaultViewport = {width: window.innerWidth, height: window.innerHeight}
+    const defaultScroll = {x: window.scrollX, y: window.scrollY}
+
+    afterEach(() => {
+      document.documentElement.removeAttribute('style')
+      document.body.removeAttribute('style')
+      document.body.innerHTML = ''
+      document.body.getBoundingClientRect = originalBodyRect
+      document.documentElement.getBoundingClientRect = originalDocumentElementRect
+      delete (document.documentElement as Partial<HTMLElement>).scrollHeight
+      stubViewport({...defaultViewport, scrollX: defaultScroll.x, scrollY: defaultScroll.y})
+    })
+
+    function stubViewport({
+      width = 1024,
+      height = 1080,
+      scrollX = 0,
+      scrollY = 0,
+    }: {width?: number; height?: number; scrollX?: number; scrollY?: number} = {}) {
+      Object.defineProperty(window, 'innerWidth', {configurable: true, value: width, writable: true})
+      Object.defineProperty(window, 'innerHeight', {configurable: true, value: height, writable: true})
+      Object.defineProperty(window, 'scrollX', {configurable: true, value: scrollX, writable: true})
+      Object.defineProperty(window, 'scrollY', {configurable: true, value: scrollY, writable: true})
+    }
+
+    function stubDocumentHeight(height: number) {
+      Object.defineProperty(document.documentElement, 'scrollHeight', {configurable: true, value: height})
+    }
+
+    function stubRect(element: Element, rect: DOMRect) {
+      element.getBoundingClientRect = () => rect
+    }
+
+    function stubBodyRect({left = 0, top = 0, width = 1024, height = 2400} = {}) {
+      document.body.getBoundingClientRect = () => makeDOMRect(left, top, width, height)
+    }
+
+    interface FixtureOptions {
+      /** Styles for wrapper elements between <body> and the floating element, outermost first. */
+      ancestors?: string[]
+      floatingStyle?: string
+      anchorRect?: DOMRect
+      floatingRect?: DOMRect
+      topLayerSelector?: ':modal' | ':popover-open'
+    }
+
+    function render({
+      ancestors = [],
+      floatingStyle = 'position: absolute',
+      anchorRect = makeDOMRect(300, 200, 50, 50),
+      floatingRect = makeDOMRect(NaN, NaN, 100, 100),
+      topLayerSelector,
+    }: FixtureOptions = {}) {
+      const float = document.createElement('div')
+      float.id = 'float'
+      float.setAttribute('style', floatingStyle)
+      float.getBoundingClientRect = () => floatingRect
+
+      let parent: HTMLElement = document.body
+      for (const [index, style] of ancestors.entries()) {
+        const wrapper = document.createElement('div')
+        wrapper.id = `ancestor-${index}`
+        wrapper.setAttribute('style', style)
+        // Give each ancestor a distinct, known rect so origins are easy to verify.
+        wrapper.getBoundingClientRect = () => makeDOMRect(100 + index * 10, 100 + index * 10, 500, 500)
+        parent.appendChild(wrapper)
+        parent = wrapper
+      }
+      parent.appendChild(float)
+
+      const anchor = document.createElement('div')
+      anchor.id = 'anchor'
+      anchor.getBoundingClientRect = () => anchorRect
+      document.body.appendChild(anchor)
+
+      if (topLayerSelector) markAsTopLayer(float, topLayerSelector)
+      return {float, anchor, floatingRect}
+    }
+
+    describe('top-layer elements (modal dialogs and native popovers)', () => {
+      it('ignores body margins and borders for absolutely positioned top-layer elements', () => {
+        stubViewport()
+        stubBodyRect({left: 200, top: 50})
+        document.body.style.borderTopWidth = '10px'
+        document.body.style.borderLeftWidth = '20px'
+        // github.com's <tool-tip> is a popover with author `position: absolute`.
+        const {float, anchor} = render({topLayerSelector: ':popover-open'})
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(254) // anchorRect.top + anchorRect.height + anchorOffset
+        expect(left).toEqual(300) // anchorRect.left
+      })
+
+      it('ignores a positioned DOM wrapper and scroll offsets', () => {
+        stubViewport({scrollX: 100, scrollY: 400})
+        stubBodyRect({left: 200, top: 30})
+        document.body.style.position = 'relative'
+        const {float, anchor} = render({
+          ancestors: ['position: relative; overflow: hidden'],
+          topLayerSelector: ':modal',
+        })
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        // Page coordinates: the initial containing block origin is (-scrollX, -scrollY)
+        expect(top).toEqual(654) // 254 + scrollY
+        expect(left).toEqual(400) // 300 + scrollX
+      })
+
+      it('uses viewport coordinates for fixed positioned top-layer elements (modal dialogs)', () => {
+        stubViewport({scrollX: 100, scrollY: 400})
+        stubBodyRect({left: 20, top: 30})
+        const {float, anchor} = render({floatingStyle: 'position: fixed', topLayerSelector: ':modal'})
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(254) // anchorRect.top + anchorRect.height + anchorOffset
+        expect(left).toEqual(300) // anchorRect.left
+      })
+
+      it('flips sides in page coordinates near the top of the document', () => {
+        stubViewport()
+        stubBodyRect({left: 200, top: 50})
+        const {float, anchor} = render({
+          anchorRect: makeDOMRect(300, 10, 50, 50),
+          topLayerSelector: ':popover-open',
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {
+          side: 'outside-top',
+          align: 'start',
+          anchorOffset: 4,
+        })
+
+        expect(anchorSide).toEqual('outside-bottom')
+        expect(top).toEqual(64)
+        expect(left).toEqual(300)
+      })
+
+      it('flips sides in page coordinates near the right edge of the viewport', () => {
+        stubViewport()
+        stubBodyRect({left: 200, top: 50})
+        const {float, anchor} = render({
+          anchorRect: makeDOMRect(950, 200, 50, 50),
+          topLayerSelector: ':popover-open',
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {
+          side: 'outside-right',
+          align: 'start',
+          anchorOffset: 4,
+        })
+
+        expect(anchorSide).toEqual('outside-left')
+        expect(top).toEqual(200)
+        expect(left).toEqual(846)
+      })
+
+      it('honors displayInViewport on a scrolled document', () => {
+        stubViewport({scrollY: 400, height: 768})
+        stubDocumentHeight(2400)
+        const {float, anchor} = render({
+          anchorRect: makeDOMRect(300, 700, 50, 50),
+          topLayerSelector: ':popover-open',
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {
+          side: 'outside-bottom',
+          align: 'start',
+          anchorOffset: 4,
+          displayInViewport: true,
+        })
+
+        expect(anchorSide).toEqual('outside-top')
+        expect(top).toEqual(996) // anchorRect.top + scrollY - anchorOffset - floatingRect.height
+        expect(left).toEqual(300)
+      })
+
+      it('uses document space for overflow when displayInViewport is not set', () => {
+        stubViewport({scrollY: 400, height: 768})
+        stubDocumentHeight(2400)
+        const {float, anchor} = render({
+          anchorRect: makeDOMRect(300, 700, 50, 50),
+          topLayerSelector: ':popover-open',
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {
+          side: 'outside-bottom',
+          align: 'start',
+          anchorOffset: 4,
+        })
+
+        expect(anchorSide).toEqual('outside-bottom')
+        expect(top).toEqual(1154)
+        expect(left).toEqual(300)
+      })
+
+      it('clamps the alignment within the viewport horizontally', () => {
+        stubViewport()
+        stubBodyRect({left: 200, top: 50})
+        const {float, anchor} = render({
+          anchorRect: makeDOMRect(950, 200, 50, 50),
+          topLayerSelector: ':popover-open',
+        })
+
+        const {top, left, anchorAlign} = getAnchoredPosition(float, anchor, {
+          side: 'outside-bottom',
+          align: 'start',
+          anchorOffset: 4,
+        })
+
+        expect(anchorAlign).toEqual('end')
+        expect(top).toEqual(254)
+        expect(left).toEqual(900)
+      })
+
+      it('treats a non-modal dialog as a DOM-positioned element', () => {
+        stubViewport()
+        const {float, anchor} = render({
+          ancestors: ['position: relative'],
+          floatingStyle: 'position: absolute',
+        })
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        // Not in the top layer: the positioned ancestor is the containing block
+        expect(top).toEqual(154) // 254 - ancestorRect.top
+        expect(left).toEqual(200) // 300 - ancestorRect.left
+      })
+    })
+
+    describe('containing block chain', () => {
+      it('ignores body margins for absolutely positioned elements without a positioned ancestor', () => {
+        stubViewport()
+        stubBodyRect({left: 200, top: 50})
+        const {float, anchor} = render()
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(254)
+        expect(left).toEqual(300)
+      })
+
+      it('positions against the document origin when the document is scrolled', () => {
+        stubViewport({scrollY: 400})
+        stubBodyRect({left: 200, top: 50 - 400})
+        const {float, anchor} = render()
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(654) // anchorRect.top + anchorRect.height + anchorOffset + scrollY
+        expect(left).toEqual(300) // anchorRect.left + scrollX
+      })
+
+      it('includes horizontal scroll', () => {
+        stubViewport({scrollX: 100})
+        stubBodyRect({left: 200 - 100, top: 50})
+        const {float, anchor} = render()
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(254)
+        expect(left).toEqual(400) // anchorRect.left + scrollX
+      })
+
+      it('uses a transformed ancestor as the containing block for absolute elements', () => {
+        stubViewport()
+        const {float, anchor} = render({ancestors: ['transform: translateX(0.001px)']})
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(154) // 254 - ancestorRect.top
+        expect(left).toEqual(200) // 300 - ancestorRect.left
+      })
+
+      it('uses a transformed ancestor as the containing block for fixed elements', () => {
+        stubViewport({scrollY: 400})
+        const {float, anchor} = render({
+          ancestors: ['transform: translateZ(0)'],
+          floatingStyle: 'position: fixed',
+        })
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(154) // 254 - ancestorRect.top
+        expect(left).toEqual(200) // 300 - ancestorRect.left
+      })
+
+      it('does not let a merely positioned ancestor capture fixed elements', () => {
+        stubViewport({scrollY: 400})
+        const {float, anchor} = render({
+          ancestors: ['position: relative; overflow: hidden'],
+          floatingStyle: 'position: fixed',
+        })
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(254) // viewport coordinates
+        expect(left).toEqual(300)
+      })
+
+      it('uses ancestors with will-change: transform as the containing block', () => {
+        stubViewport()
+        const {float} = render({floatingStyle: 'position: fixed', ancestors: ['will-change: transform']})
+        const {top, left} = getAnchoredPosition(float, document.querySelector('#anchor')!, {anchorOffset: 4})
+        expect(top).toEqual(154)
+        expect(left).toEqual(200)
+      })
+
+      it('uses ancestors with contain: paint as the containing block', () => {
+        stubViewport()
+        const {float, anchor} = render({ancestors: ['contain: paint']})
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+        expect(top).toEqual(154)
+        expect(left).toEqual(200)
+      })
+
+      it('uses ancestors with content-visibility: auto as the containing block', () => {
+        stubViewport()
+        const {float, anchor} = render({
+          ancestors: ['content-visibility: auto'],
+          floatingStyle: 'position: fixed',
+        })
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+        expect(top).toEqual(154)
+        expect(left).toEqual(200)
+      })
+
+      it('does not use ancestors that only create a stacking context', () => {
+        stubViewport()
+        const {float, anchor} = render({ancestors: ['isolation: isolate; opacity: 0.99']})
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+        expect(top).toEqual(254)
+        expect(left).toEqual(300)
+      })
+
+      it('skips display: contents ancestors, which generate no box', () => {
+        stubViewport()
+        const {float, anchor} = render({ancestors: ['position: relative; display: contents']})
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+        expect(top).toEqual(254)
+        expect(left).toEqual(300)
+      })
+
+      it('uses a positioned body as the containing block', () => {
+        stubViewport()
+        document.body.style.position = 'relative'
+        stubBodyRect({left: 20, top: 30, width: 880, height: 2400})
+        const {float, anchor} = render()
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(224) // 254 - bodyRect.top
+        expect(left).toEqual(280) // 300 - bodyRect.left
+      })
+
+      it('adds the positioned body borders to the containing block', () => {
+        stubViewport()
+        document.body.style.position = 'relative'
+        document.body.style.borderTopWidth = '10px'
+        document.body.style.borderLeftWidth = '20px'
+        stubBodyRect({left: 20, top: 30, width: 880, height: 2400})
+        const {float, anchor} = render()
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(214) // 254 - bodyRect.top - borderTopWidth
+        expect(left).toEqual(260) // 300 - bodyRect.left - borderLeftWidth
+      })
+
+      it('uses a transformed body as the containing block for fixed elements', () => {
+        stubViewport()
+        document.body.style.transform = 'translateX(0.001px)'
+        stubBodyRect({left: 20, top: 30, width: 1000, height: 2400})
+        const {float, anchor} = render({floatingStyle: 'position: fixed'})
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(224) // 254 - bodyRect.top
+        expect(left).toEqual(280) // 300 - bodyRect.left
+      })
+
+      it('uses a positioned root element as the containing block', () => {
+        stubViewport()
+        document.documentElement.style.position = 'relative'
+        stubRect(document.documentElement, makeDOMRect(10, 20, 1000, 500))
+        const {float, anchor} = render()
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(234) // 254 - rootRect.top
+        expect(left).toEqual(290) // 300 - rootRect.left
+      })
+
+      it('clamps the alignment within the viewport horizontally', () => {
+        stubViewport()
+        stubBodyRect({left: 200, top: 50})
+        const {float, anchor} = render({anchorRect: makeDOMRect(950, 200, 50, 50)})
+
+        const {top, left, anchorAlign} = getAnchoredPosition(float, anchor, {
+          side: 'outside-bottom',
+          align: 'start',
+          anchorOffset: 4,
+        })
+
+        expect(anchorAlign).toEqual('end')
+        expect(top).toEqual(254)
+        expect(left).toEqual(900)
+      })
+    })
+
+    describe('clipping ancestors', () => {
+      it('ignores overflow below the containing block', () => {
+        stubViewport()
+        const {float, anchor} = render({
+          // The positioned ancestor is the containing block; the overflow box below it
+          // cannot clip the element, so the document's scrollable space is available.
+          ancestors: ['position: relative', 'overflow: hidden'],
+          anchorRect: makeDOMRect(220, 270, 20, 20),
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(anchorSide).toEqual('outside-bottom')
+        expect(top).toEqual(194) // 270 + 20 + 4 - ancestorRect.top
+        expect(left).toEqual(120) // 220 - ancestorRect.left
+      })
+
+      it('flips inside an overflow ancestor at or above the containing block', () => {
+        stubViewport()
+        const {float, anchor} = render({
+          ancestors: ['overflow: hidden', 'position: relative'],
+          anchorRect: makeDOMRect(120, 570, 20, 20),
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(anchorSide).toEqual('outside-top')
+        expect(top).toEqual(356) // 570 - 4 - 100 - containingBlockRect.top
+        expect(left).toEqual(10) // 120 - containingBlockRect.left
+      })
+
+      it('flips inside a scrollable containing block', () => {
+        stubViewport()
+        const {float, anchor} = render({
+          ancestors: ['position: relative; overflow: auto'],
+          anchorRect: makeDOMRect(120, 570, 20, 20),
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(anchorSide).toEqual('outside-top')
+        expect(top).toEqual(366) // 570 - 4 - 100 - ancestorRect.top
+        expect(left).toEqual(20) // 120 - ancestorRect.left
+      })
+
+      it('does not clip fixed elements with overflow ancestors', () => {
+        stubViewport({height: 1080})
+        const {float, anchor} = render({
+          ancestors: ['overflow: hidden'],
+          floatingStyle: 'position: fixed',
+          anchorRect: makeDOMRect(300, 960, 50, 50),
+        })
+
+        const {top, anchorSide} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        // Clipped by the viewport only, so the side flips at the bottom of the viewport
+        expect(anchorSide).toEqual('outside-top')
+        expect(top).toEqual(856) // 960 - 4 - 100
+      })
+    })
+
+    describe('fixed-positioned elements', () => {
+      it('positions against the viewport, ignoring body margins and scroll', () => {
+        stubViewport({scrollY: 400})
+        stubBodyRect({left: 200, top: 50 - 400})
+        const {float, anchor} = render({floatingStyle: 'position: fixed'})
+
+        const {top, left} = getAnchoredPosition(float, anchor, {anchorOffset: 4})
+
+        expect(top).toEqual(254)
+        expect(left).toEqual(300)
+      })
+
+      it('honors displayInViewport near the bottom of the viewport', () => {
+        stubViewport({height: 768})
+        stubBodyRect({left: 200, top: 50})
+        const {float, anchor} = render({
+          floatingStyle: 'position: fixed',
+          anchorRect: makeDOMRect(300, 700, 50, 50),
+        })
+
+        const {top, left, anchorSide} = getAnchoredPosition(float, anchor, {
+          side: 'outside-bottom',
+          align: 'start',
+          anchorOffset: 4,
+          displayInViewport: true,
+        })
+
+        expect(anchorSide).toEqual('outside-top')
+        expect(top).toEqual(596) // anchorRect.top - anchorOffset - floatingRect.height
+        expect(left).toEqual(300)
+      })
     })
   })
 })

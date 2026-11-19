@@ -16,13 +16,32 @@ When calculating the position of the floating element, the algorithm relies on d
 
 The public API only asks for the first two elements; the floating element's container is discovered via DOM traversal.
 
+### Finding the floating element's containing block
+
+The returned anchored position calculation is relative to the floating element's CSS [_containing block_](https://developer.mozilla.org/en-US/docs/Web/CSS/Containing_block). It is resolved with the same rules the browser uses to lay the element out:
+
+- **Top-layer elements** (modal `<dialog>`s and open native popovers) are not positioned by their DOM ancestors. Their containing block is the viewport when their computed `position` is `fixed`, and the [_initial containing block_](https://developer.mozilla.org/en-US/docs/Web/CSS/Containing_block#identifying_the_containing_block) otherwise. Non-modal dialogs are not in the top layer and are positioned like any other element.
+- **`position: fixed`** elements are positioned against the viewport, unless an ancestor establishes a containing block for fixed descendants (see below).
+- **`position: absolute`** elements are positioned against the nearest ancestor that is not `position: static` (or that establishes a containing block for positioned descendants — see below).
+- Otherwise the containing block is the initial containing block, whose origin is the document origin. In the client coordinates returned by `getBoundingClientRect`, that origin is `(-scrollX, -scrollY)`.
+
+The following computed-style properties on an ancestor establish a containing block for absolutely positioned descendants, and also for fixed positioned descendants: `transform`, `translate`, `rotate`, `scale`, `perspective`, `filter`, `backdrop-filter`, `contain: layout | paint | strict | content`, `will-change` listing any transform-like property, `content-visibility` other than `visible`, and `transform-style: preserve-3d`. Ancestors with `display: contents` generate no box and are skipped. Properties that only create a stacking context (for example `isolation`, `opacity`, `container-type`, `mask-image` or `clip-path`) do not establish a containing block.
+
+Note that `document.body` is not used as a fallback containing block: it only establishes one when it is itself positioned. In particular, `margin` or `border` set on `document.body` does not affect the returned coordinates.
+
 ### Finding the floating element's clipping container
 
-The returned anchored position calculation is relative to the floating element's closest [_positioned_](https://developer.mozilla.org/en-US/docs/Web/CSS/position#types_of_positioning) ancestor. To find this ancestor, we try to check parents of the floating element until we find one that has a position set to anything other than `static` and use that element's bounding box as the container. If we can't find such an element, we will try to use `document.body`.
+An `overflow` ancestor only clips the floating element when it is at or above the element's containing block. Overflow between the element and its containing block is escaped, because the element is positioned against the containing block. The clipping container is the nearest overflow ancestor at or above the containing block.
 
-Once we have found the appropriate relative ancestor, we attempt to find the floating element's _clipping container_. The clipping container is an element that: 1) has `overflow` set to something other than `visible`, and 2) is either an ancestor of the relative ancestor, or is itself the relative ancestor. Again, if we cannot locate such an element, we will use `document.body` as the clipping container.
+When there is no clipping ancestor, the available space is the whole scrollable document (the element scrolls with the document); for fixed positioned elements it is the visible viewport, because no amount of scrolling can bring them into view. The clipping rectangle covers the document's scrollable height and the viewport width in the first case, and the viewport in the second, so that horizontal overflow of the document does not move the floating element off-screen.
 
 Once we have the clipping container, its bounding box is used as the viewport for the position calculation (see the next section). If the clipping container ends up being `document.body`, we take one additional step, allowing the clipping rectangle to be at least as tall as the window. This is done because the `body` element doesn't take up the full window size by default, but we still want to allow the entire space to be used as the viewport for the position calculation. It may be a good idea to ensure that this clipping container element _also_ contains the anchor element and is scrollable. This will ensure that if scrolled, the anchor and floating element will move together.
+
+### Known limitations
+
+- The clipping rectangle is derived from a single clipping ancestor. When several ancestors clip, the effective region is their intersection, which the algorithm approximates by using the nearest one.
+- The algorithm works in CSS pixels and does not model the visual viewport (for example during pinch zoom on mobile).
+- For transformed containing blocks, offsets are derived from the transformed border box; fractional differences can appear when the ancestor is rotated or scaled.
 
 ### Positioning and overflow
 

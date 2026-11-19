@@ -140,6 +140,13 @@ interface BoxPosition extends Size, Position {}
  * of the floating element in order to absolutely position it such that it appears
  * near the anchor element.
  *
+ * The returned coordinates are relative to the floating element's CSS containing
+ * block: the padding box of its closest positioned ancestor, or, when there is no
+ * positioned ancestor, the viewport (fixed positioning) or the initial containing
+ * block (everything else, including elements in the top layer). Note that
+ * `document.body` is not used as the containing block; its margins and borders are
+ * therefore not subtracted from the result.
+ *
  * @param floatingElement Element intended to be positioned near or within an anchor
  * @param anchorElement The element to serve as the position anchor
  * @param settings Settings to determine the rules for positioning the floating element
@@ -150,28 +157,43 @@ export function getAnchoredPosition(
   anchorElement: Element | DOMRect,
   settings: Partial<PositionSettings> = {},
 ): AnchorPosition {
-  const {
-    positionedParent: parentElement,
-    clippingNode,
-    positionedParentStyle,
-    clippingNodeStyle,
-  } = getPositionedParentAndClippingNode(floatingElement)
-  const clippingRect = getClippingRect(clippingNode, clippingNodeStyle)
+  const {containingBlock, containingBlockStyle, clippingNode, clippingNodeStyle, isFixed} =
+    getContainingBlockInfo(floatingElement)
 
-  // Use cached style if available, otherwise compute it
-  const parentElementStyle = positionedParentStyle || getComputedStyle(parentElement)
-  const parentElementRect = parentElement.getBoundingClientRect()
-  const [borderTop, borderLeft] = [parentElementStyle.borderTopWidth, parentElementStyle.borderLeftWidth].map(
-    v => parseInt(v, 10) || 0,
-  )
-  const relativeRect = {
-    top: parentElementRect.top + borderTop,
-    left: parentElementRect.left + borderLeft,
+  // The returned offsets are relative to the floating element's containing block. In
+  // client coordinates that origin is the block's padding box, the viewport's top-left
+  // corner (fixed positioning / top layer), or the initial containing block's top-left
+  // corner, which is the document origin at (-scrollX, -scrollY).
+  let relativePosition: Position
+  let clippingRect: BoxPosition
+
+  if (containingBlock) {
+    const containingBlockRect = containingBlock.getBoundingClientRect()
+    const [borderTop, borderLeft] = [
+      containingBlockStyle?.borderTopWidth ?? '',
+      containingBlockStyle?.borderLeftWidth ?? '',
+    ].map(v => parseInt(v, 10) || 0)
+    relativePosition = {
+      top: containingBlockRect.top + borderTop,
+      left: containingBlockRect.left + borderLeft,
+    }
+    clippingRect = clippingNode ? getClippingRect(clippingNode, clippingNodeStyle) : getDocumentRect()
+  } else if (isFixed) {
+    // Fixed-positioned elements (including fixed-positioned top-layer elements such as
+    // modal dialogs) are positioned against the viewport and cannot be scrolled into view.
+    relativePosition = {top: 0, left: 0}
+    clippingRect = getViewportRect()
+  } else {
+    // Everything else (including top-layer elements with `position: absolute`) is
+    // positioned against the initial containing block. The element scrolls with the
+    // document, so the whole scrollable document is available as visible space.
+    relativePosition = {top: -(window.scrollY || 0), left: -(window.scrollX || 0)}
+    clippingRect = getDocumentRect()
   }
 
   return pureCalculateAnchoredPosition(
     clippingRect,
-    relativeRect,
+    relativePosition,
     floatingElement.getBoundingClientRect(),
     anchorElement instanceof Element ? anchorElement.getBoundingClientRect() : anchorElement,
     getDefaultSettings(settings),
@@ -179,83 +201,165 @@ export function getAnchoredPosition(
   )
 }
 
-interface ParentAndClippingInfo {
-  positionedParent: HTMLElement
-  clippingNode: HTMLElement
-  positionedParentStyle: CSSStyleDeclaration | null
+interface ContainingBlockInfo {
+  /** The nearest ancestor that establishes the floating element's containing block. */
+  containingBlock: HTMLElement | null
+  containingBlockStyle: CSSStyleDeclaration | null
+  /**
+   * The nearest `overflow` ancestor that clips the floating element. Only ancestors at
+   * or above the containing block clip the element; overflow below the containing block
+   * is escaped because the element is positioned against the containing block.
+   */
+  clippingNode: HTMLElement | null
   clippingNodeStyle: CSSStyleDeclaration | null
+  /** Whether the floating element is `position: fixed`. */
+  isFixed: boolean
+}
+
+// Properties that establish a containing block for absolutely and fixed positioned
+// descendants, in addition to `position` (which only applies to absolute descendants).
+// https://developer.mozilla.org/en-US/docs/Web/CSS/Containing_block#identifying_the_containing_block
+const WILL_CHANGE_CONTAINING_BLOCK = /transform|translate|scale|rotate|perspective|filter/
+const CONTAIN_CONTAINING_BLOCK = /layout|paint|strict|content/
+
+function isNone(value: string | null | undefined): boolean {
+  return !value || value === 'none'
+}
+
+function establishesContainingBlock(style: CSSStyleDeclaration): boolean {
+  return (
+    !isNone(style.transform) ||
+    !isNone(style.translate) ||
+    !isNone(style.scale) ||
+    !isNone(style.rotate) ||
+    !isNone(style.perspective) ||
+    !isNone(style.filter) ||
+    !isNone(style.backdropFilter) ||
+    WILL_CHANGE_CONTAINING_BLOCK.test(style.willChange || '') ||
+    CONTAIN_CONTAINING_BLOCK.test(style.contain || '') ||
+    (style.transformStyle || 'flat') === 'preserve-3d' ||
+    (style.contentVisibility || 'visible') !== 'visible'
+  )
+}
+
+function isOverflowClipping(style: CSSStyleDeclaration): boolean {
+  return /auto|scroll|overlay|hidden|clip/.test(
+    `${style.overflow || ''} ${style.overflowX || ''} ${style.overflowY || ''}`,
+  )
 }
 
 /**
- * Returns both the positioned parent and clipping node in a single DOM traversal.
- * This optimizes performance by reducing the number of getComputedStyle calls.
- * Also returns cached computed styles to avoid redundant getComputedStyle calls later.
+ * Returns the containing block and clipping ancestor for a floating element.
+ *
+ * The containing block is the nearest ancestor that establishes one: a positioned
+ * ancestor for `position: absolute`, or an ancestor with a transform-like property for
+ * either `position`. When there is none the containing block is the initial containing
+ * block (or the viewport for fixed positioning), and DOM ancestors cannot clip it.
+ * Top-layer elements are not positioned or clipped by their DOM ancestors at all.
  */
-function getPositionedParentAndClippingNode(element: Element): ParentAndClippingInfo {
-  if (isOnTopLayer(element)) {
+function getContainingBlockInfo(element: Element): ContainingBlockInfo {
+  const {position} = getComputedStyle(element)
+  const isFixed = (position || 'static') === 'fixed'
+  const isTopLayer = isOnTopLayer(element)
+
+  if (isTopLayer) {
     return {
-      positionedParent: document.body,
-      clippingNode: document.body,
-      positionedParentStyle: null,
+      containingBlock: null,
+      containingBlockStyle: null,
+      clippingNode: null,
       clippingNodeStyle: null,
+      isFixed,
     }
   }
 
-  let positionedParent: HTMLElement | null = null
+  let containingBlock: HTMLElement | null = null
+  let containingBlockStyle: CSSStyleDeclaration | null = null
   let clippingNode: HTMLElement | null = null
-  let positionedParentStyle: CSSStyleDeclaration | null = null
   let clippingNodeStyle: CSSStyleDeclaration | null = null
-  let parentNode = element.parentNode
 
-  while (parentNode !== null && parentNode !== document.body) {
-    if (parentNode instanceof HTMLElement) {
-      // Get computed style once per element
-      const style = getComputedStyle(parentNode)
-
-      // Check for positioned parent (only set first one found)
-      if (!positionedParent && style.position !== 'static') {
-        positionedParent = parentNode
-        positionedParentStyle = style
+  let node: Node | null = element.parentNode
+  while (node !== null) {
+    if (node instanceof HTMLElement) {
+      const style = getComputedStyle(node)
+      // Elements without a box (display: contents) cannot establish a containing block
+      // nor clip anything, even if their computed `position` is not static.
+      if ((style.display || 'block') !== 'contents') {
+        if (containingBlock === null) {
+          const establishes =
+            establishesContainingBlock(style) || (!isFixed && (style.position || 'static') !== 'static')
+          if (establishes) {
+            containingBlock = node
+            containingBlockStyle = style
+            if (isOverflowClipping(style)) {
+              clippingNode = node
+              clippingNodeStyle = style
+            }
+          }
+        } else if (clippingNode === null && isOverflowClipping(style)) {
+          clippingNode = node
+          clippingNodeStyle = style
+        }
       }
 
-      // Check for clipping ancestor (only set first one found)
-      if (!clippingNode && style.overflow !== 'visible') {
-        clippingNode = parentNode
-        clippingNodeStyle = style
-      }
-
-      // If we've found both, we can exit early
-      if (positionedParent && clippingNode) {
+      // Once the containing block and its nearest clipping ancestor are known there is
+      // nothing left to resolve (overflow below the containing block does not clip).
+      if (containingBlock !== null && (clippingNode !== null || node === document.documentElement)) {
         break
       }
     }
-    parentNode = parentNode.parentNode
+    if (node === document.documentElement) break
+    node = node.parentNode
   }
 
+  return {containingBlock, containingBlockStyle, clippingNode, clippingNodeStyle, isFixed}
+}
+
+/** Returns true if the element is currently rendered in the top layer. */
+function isOnTopLayer(element: Element): boolean {
+  if (typeof element.matches !== 'function') {
+    return false
+  }
+  // Modal dialogs and open native popovers are rendered in the top layer, where they are
+  // not positioned by their DOM ancestors. The selectors throw in browsers (and DOM
+  // implementations) that do not support that part of the platform.
+  for (const selector of [':modal', ':popover-open']) {
+    try {
+      if (element.matches(selector)) {
+        return true
+      }
+    } catch {
+      // Selector not supported; try the next one.
+    }
+  }
+  return false
+}
+
+/** The visible viewport, in client coordinates. */
+function getViewportRect(): BoxPosition {
+  const documentElement = document.documentElement
   return {
-    positionedParent: positionedParent ?? document.body,
-    clippingNode: clippingNode ?? document.body,
-    positionedParentStyle,
-    clippingNodeStyle,
+    top: 0,
+    left: 0,
+    width: documentElement.clientWidth || window.innerWidth,
+    height: documentElement.clientHeight || window.innerHeight,
   }
 }
 
 /**
- * Returns true if the element is likely to be on the `top-layer`.
+ * The scrollable document area, in client coordinates: the initial containing block is
+ * anchored to the document origin, so this covers everything that can be scrolled into
+ * view. `window` dimensions are used as a fallback in environments without layout.
  */
-function isOnTopLayer(element: Element) {
-  if (element.tagName === 'DIALOG') {
-    return true
+function getDocumentRect(): BoxPosition {
+  const scrollX = window.scrollX || 0
+  const scrollY = window.scrollY || 0
+  const documentElement = document.documentElement
+  return {
+    top: -scrollY,
+    left: -scrollX,
+    width: documentElement.clientWidth || window.innerWidth,
+    height: Math.max(documentElement.scrollHeight, documentElement.clientHeight, window.innerHeight),
   }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    if (element.matches(':popover-open') && /native code/.test((document.body as any).showPopover?.toString())) {
-      return true
-    }
-  } catch {
-    return false
-  }
-  return false
 }
 
 /**
