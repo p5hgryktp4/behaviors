@@ -29,3 +29,14 @@ yarn add @primer/behaviors
 ```bash
 npm run storybook
 ```
+
+## Testing
+
+```bash
+npm test              # unit tests (jest + jsdom)
+npm run test:browser  # layout tests in Chromium, Firefox and WebKit (Playwright)
+```
+
+`npm run test:browser` builds the package and runs the Playwright suite in
+`tests/browser` against `dist/`. Install the browsers once with
+`npx playwright install chromium firefox webkit`.

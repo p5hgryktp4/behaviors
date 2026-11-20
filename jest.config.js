@@ -7,6 +7,7 @@
 module.exports = {
   clearMocks: true,
   testEnvironment: 'jsdom',
+  testPathIgnorePatterns: ['<rootDir>/tests/browser/'],
   transform: {
     '^.+\\.tsx?$': 'esbuild-jest'
   },

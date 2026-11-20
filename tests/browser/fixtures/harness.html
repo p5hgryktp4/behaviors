@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>anchored-position browser harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      /* Neutralize UA styles for top-layer elements so fixtures control placement. */
+      dialog,
+      [popover] {
+        margin: 0;
+        padding: 0;
+        border: 0;
+        inset: auto;
+      }
+    </style>
+    <style id="fixture-style"></style>
+  </head>
+  <body>
+    <script type="module">
+      import {getAnchoredPosition} from '/dist/esm/index.mjs'
+      window.__getAnchoredPosition = getAnchoredPosition
+      window.__ready = true
+    </script>
+  </body>
+</html>

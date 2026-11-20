@@ -13,5 +13,34 @@
     "import/no-unresolved": "off",
     "import/no-named-as-default": "off"
   },
-  "ignorePatterns": ["dist"]
+  "ignorePatterns": ["dist"],
+  "overrides": [
+    {
+      "files": ["tests/browser/**/*.ts"],
+      "rules": {
+        "github/unescaped-html-literal": "off",
+        "github/no-inner-html": "off"
+      }
+    },
+    {
+      "files": ["tests/browser/**/*.{js,mjs}", "tests/browser/**/server.mjs"],
+      "env": {
+        "browser": true,
+        "node": true
+      },
+      "rules": {
+        "github/unescaped-html-literal": "off",
+        "github/no-inner-html": "off",
+        "import/no-nodejs-modules": "off",
+        "no-console": "off",
+        "filenames/match-regex": "off"
+      }
+    },
+    {
+      "files": ["tests/browser/playwright.config.ts"],
+      "rules": {
+        "import/no-nodejs-modules": "off"
+      }
+    }
+  ]
 }
